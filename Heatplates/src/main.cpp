@@ -188,8 +188,8 @@ sTune p1tuner = sTune(&PlateData1.temperature, &PlateData1.output, p1tuner.ZN_PI
 QuickPID PIDPlate0(&PlateData0.temperature, &PlateData0.output, &setpoint);
 QuickPID PIDPlate1(&PlateData1.temperature, &PlateData1.output, &setpoint);
 
-Plate plate0(MAX31865(), p0tuner, PIDPlate0, PlateData0, STuneSettings());
-Plate plate1(MAX31865(), p1tuner, PIDPlate1, PlateData1, STuneSettings());
+Plate plate0(MAX31865(), p0tuner, PIDPlate0, PlateData0, &STuneSettings());
+Plate plate1(MAX31865(), p1tuner, PIDPlate1, PlateData1, &STuneSettings());
 
 LCD_I2C lcd(0x27, 16, 2);
 LCD_I2CAdapter lcdAdapter(&lcd);
@@ -273,7 +273,8 @@ void heating_loop() {
         stop_heating();
         return;
     }
-
+    plate0.data.tunedoutput = plate0.tuner.softPwm(plate0.data.heaterPin, plate0.data.temperature, plate0.data.output, setpoint, plate0.sTuneConfig.outputSpan, plate0.sTuneConfig.debounce);
+    plate1.data.tunedoutput = plate1.tuner.softPwm(plate1.data.heaterPin, plate1.data.temperature, plate1.data.output, setpoint, plate1.sTuneConfig.outputSpan, plate1.sTuneConfig.debounce);
     UpdateTemps();
     PrintTemps();
     Temp_Sanity_Tests();
@@ -305,6 +306,10 @@ void heating_loop() {
 
     handleTuner(plate0, PIDPlate0);
     handleTuner(plate1, PIDPlate1);
+    returntomenu();
+    heating_loop();
+  
+  
 }
 void stop_failure()
 {
