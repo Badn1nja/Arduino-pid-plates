@@ -1,0 +1,215 @@
+#include <Adafruit_MAX31865.h>
+#include <Adafruit_BusIO_Register.h>
+#include <AutoPID.h>
+#include <SPI.h>
+#include <Wire.h>
+#include "Arduino.h"
+
+// moi bichette
+
+
+// Constants
+#define RESISTANCE_REF 430.0
+#define RESISTANCE_NOMINAL 100.0
+#define MAX_TEMP_CUTOFF_VALUE 150
+#define PID_UPDATE_INTERVAL 4000
+#define TEMP_READ_DELAY 500
+
+// PID settings and gains
+#define OUTPUT_MIN 0
+#define OUTPUT_MAX 255
+
+#define KP 0.12
+#define KI 0.0003
+#define KD 0
+
+#define KP2 0.12
+#define KI2 0.0003
+#define KD2 0
+// Heater Pins
+#define PLATE_HEATER1 PB3
+#define PLATE_HEATER_1 PB2
+#define PLATE_HEATER2 PA1
+#define PLATE_HEATER_2 PA0
+
+// Control Pin
+#define POT_PIN A0
+#define INT_LED PC13
+#define READY1_LED PB5
+#define READY2_LED PB6
+
+// SPI + CS pins
+#define MAX31865_CS_1 PB13
+#define MAX31865_CS_2 PB14
+#define SPI_MOSI PA7
+#define SPI_MISO PA6
+#define SPI_SCK PA5
+
+// Global Variables
+unsigned long lastTempUpdate;
+static int faultCheckCounter = 10; //because we can run on boot with this  
+float requested_temp = 0;
+double plate_temp1, plate_temp2, AMBIENT_TEMP, pid_out1, pid_out2;
+
+// int
+Adafruit_MAX31865 temp_sensor_1 = Adafruit_MAX31865(MAX31865_CS_1);
+Adafruit_MAX31865 temp_sensor_2 = Adafruit_MAX31865(MAX31865_CS_2);
+AutoPID PLATE1PID(&plate_temp1, &requested_temp, &pid_out1, OUTPUT_MIN, OUTPUT_MAX, KP, KI, KD);
+AutoPID PLATE2PID(&plate_temp2, &requested_temp, &pid_out2, OUTPUT_MIN, OUTPUT_MAX, KP2, KI2, KD2);
+
+void setup() {
+    // begin comms
+    Serial.begin(115200);  
+    SPI.begin();
+
+    // set pins
+    pinMode(PLATE_HEATER1, OUTPUT);
+    pinMode(PLATE_HEATER_1, OUTPUT);
+    pinMode(PLATE_HEATER2, OUTPUT);
+    pinMode(PLATE_HEATER_2, OUTPUT);
+    pinMode(READY1_LED, OUTPUT);
+    pinMode(READY2_LED, OUTPUT);
+    pinMode(INT_LED, OUTPUT);
+    pinMode(POT_PIN, INPUT);
+  
+    if (!temp_sensor_1.begin(MAX31865_3WIRE) || !temp_sensor_2.begin(MAX31865_3WIRE)) {
+        Serial.println("Sensor initialization failed!");
+        while (1); // Halt execution
+    }
+    // validate sensors
+
+    checkFaults();
+    lastTempUpdate = millis(); // Initialize lastTempUpdate
+    readSensors();
+    devianceCheck();
+    startTemps();
+
+    // set pid interval
+    PLATE1PID.setTimeStep(PID_UPDATE_INTERVAL);
+    PLATE2PID.setTimeStep(PID_UPDATE_INTERVAL);
+
+}
+
+void loop() {
+    checkFaults();
+    tempSanity();
+    updateTemperature();
+    tempDemand();
+  
+    // Run PID control
+    PLATE1PID.run();
+    PLATE2PID.run();
+
+    heaterPWM();
+
+    // Calculate the average PID output and control the LED
+    heaterLED();
+
+    // Update the status of the ready LEDs
+    updateReadyLEDs();
+}
+
+void heaterLED()
+{
+    double averageOutput = (pid_out1 + pid_out2) / 2;
+    analogWrite(INT_LED, averageOutput);
+}
+
+void heaterPWM()
+    {
+        analogWrite(PLATE_HEATER1, pid_out1);
+        analogWrite(PLATE_HEATER_1, pid_out1);
+        analogWrite(PLATE_HEATER2, pid_out2);
+        analogWrite(PLATE_HEATER_2, pid_out2);
+    }
+void startTemps()
+    {
+        double avg = ((plate_temp1 + plate_temp2) / 2);
+        AMBIENT_TEMP = round(avg);
+    }
+void updateReadyLEDs() {
+    // Check if plate 1 temperature is within 95% of the requested temperature
+    if (plate_temp1 >= (requested_temp * 0.95)) {
+        digitalWrite(READY1_LED, HIGH);
+    } else {
+        digitalWrite(READY1_LED, LOW);
+    }
+
+    // Check if plate 2 temperature is within 95% of the requested temperature
+    if (plate_temp2 >= (requested_temp * 0.95)) {
+        digitalWrite(READY2_LED, HIGH);
+    } else {
+        digitalWrite(READY2_LED, LOW);
+    }
+}
+bool updateTemperature() {
+    if ((millis() - lastTempUpdate) > TEMP_READ_DELAY) {
+        readSensors();
+        lastTempUpdate = millis();
+        return true;
+    }
+}
+
+void tempDemand(){
+    int potValue = analogRead(POT_PIN);
+    requested_temp = map(potValue, 0, 1023, 60, 120);
+    // Optionally, print the requested temperature for debugging
+    Serial.print("Requested Temperature: ");
+    Serial.println(requested_temp);  
+}
+
+void checkFaults() {
+    const int checkInterval = 10;
+    if (faultCheckCounter >= checkInterval) {
+        checkSensorFault(temp_sensor_1, "Sensor 1");
+        checkSensorFault(temp_sensor_2, "Sensor 2");
+        faultCheckCounter = 0;
+    } else {
+        faultCheckCounter++;
+    }
+}
+
+void devianceCheck() {  
+    int deviance = fabs(plate_temp1 - plate_temp2);
+    Serial.printf("deviance: %d\n", deviance);
+}
+
+void checkSensorFault(Adafruit_MAX31865 &sensor, const char* sensorName) {
+    uint8_t fault = sensor.readFault();
+    if (fault) {
+        Serial.print(sensorName);
+        Serial.print(" Fault: ");
+        if (fault & MAX31865_FAULT_HIGHTHRESH) Serial.println("High Threshold");
+        if (fault & MAX31865_FAULT_LOWTHRESH) Serial.println("Low Threshold");
+        if (fault & MAX31865_FAULT_REFINLOW) Serial.println("REFIN- > 0.85 x Bias");
+        if (fault & MAX31865_FAULT_REFINHIGH) Serial.println("REFIN- < 0.85 x Bias - FORCE- open");
+        if (fault & MAX31865_FAULT_RTDINLOW) Serial.println("RTDIN- < 0.85 x Bias - FORCE- open");
+        if (fault & MAX31865_FAULT_OVUV) Serial.println("Under/Over Voltage");
+        stop_failure();
+    }
+}
+
+void tempSanity() {
+    if (plate_temp1 >= MAX_TEMP_CUTOFF_VALUE || plate_temp2 >= MAX_TEMP_CUTOFF_VALUE) {
+        Serial.println("OVERTEMP Triggered");
+        stop_failure();
+    }
+}
+
+void readSensors() {
+    plate_temp1 = temp_sensor_1.temperature(RESISTANCE_NOMINAL, RESISTANCE_REF);
+    plate_temp2 = temp_sensor_2.temperature(RESISTANCE_NOMINAL, RESISTANCE_REF);
+
+    Serial.print("Plate 1 Temperature: ");
+    Serial.println(plate_temp1);
+    Serial.print("Plate 2 Temperature: ");
+    Serial.println(plate_temp2);
+}
+ 
+void stop_failure() {
+    digitalWrite(PLATE_HEATER1, LOW);
+    digitalWrite(PLATE_HEATER_1, LOW);
+    digitalWrite(PLATE_HEATER2, LOW);
+    digitalWrite(PLATE_HEATER_2, LOW);
+    Serial.println("Issue detected! Heaters off.");
+} 

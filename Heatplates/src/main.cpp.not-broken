@@ -1,0 +1,314 @@
+//***********************************************
+//    * Project: Heat Plate PID Controller System
+//    * Author: Badn1nja
+//    * Description:
+//    *  This project controls the temperature of heat plates using PID controllers.
+//    *  It reads temperature data from MAX31865 RTD sensors (Pt100), applies PID control
+//    *  to two heaters (PLATE_HEATER0 and PLATE_HEATER1), and displays key information
+//    *  on an LCD screen (16x2, I2C).
+//    *
+//    *  The user interacts with the system via an LCD menu interface, where they can:
+//    *   - Start the system with default settings
+//    *   - Adjust temperature settings
+//    *   - Perform an autotune to automatically adjust PID parameters (WIP)
+//    *   - Monitor real-time temperature readings and control feedback
+//    *
+//    *  The system uses AutoPID and sTune libraries for PID control and tuning,
+//    *  along with the SimpleRotary library to handle rotary encoder inputs.
+//    *
+//    *  ** Hardware: **
+//    *   - Arduino (e.g., Uno, Nano)
+//    *   - MAX31865 RTD sensor (Pt100) for temperature measurement
+//    *   - LCD I2C (16x2) display for UI
+//    *   - Rotary Encoder for user interaction
+//    *   - 2x heaters
+//    *
+//    *  ** Libraries Used: **
+//    *   - QuickPID (PID Control))
+//    *   - sTune (PID Tuning)
+//    *   - LcdMenu (Menu System)
+//    *   - SimpleRotary (Rotary Encoder)
+//    *   - MAX31865 (Temperature Sensing)
+//    **************************************************/
+//    * DECLARATIONS / Settings ******************************************************/
+//    **************************************************/
+#include "Arduino.h"
+#include <SPI.h>
+#include <PwFusion_MAX31865.h>
+#include <pt100rtd.h>
+#include <Wire.h>
+#include <LCD_I2C.h>
+#include <ItemCommand.h>
+#include <ItemInput.h>
+#include <ItemInputCharset.h>
+#include <ItemSubMenu.h>
+#include <LcdMenu.h>
+#include <display/LCD_I2CAdapter.h>
+#include <MenuScreen.h>
+#include <SimpleRotary.h>
+#include <input/SimpleRotaryAdapter.h>
+#include <renderer/CharacterDisplayRenderer.h>
+#include <ItemWidget.h>
+#include <widget/WidgetBool.h>
+#include <widget/WidgetList.h>
+#include <widget/WidgetRange.h>
+#include <sTune.h>
+#include <QuickPID.h>
+
+const int PLATE_HEATER0 = 6;
+const int PLATE_HEATER1 = 7;
+const int ENCODER_PIN_A = 2;
+const int ENCODER_PIN_B = 3; // Meant to be 2,3,4 but my encoder is backwards to this
+const int ENCODER_PIN_SW = 4;
+const int CS0_PIN = 9;
+const int CS1_PIN = 8;
+
+struct STuneSettings {
+  uint32_t settleTimeSec = 10;
+  uint32_t testTimeSec = 500;
+  uint16_t samples = 500;
+  float inputSpan = 200;
+  float outputSpan = 1000;
+  float outputStart = 0;
+  float outputStep = 50;
+  float tempLimit = 150;
+  uint8_t debounce = 1;
+};
+
+#define MAX_TEMP_CUTOFF_VALUE 150 // safety cut off
+#define PID_UPDATE_INTERVAL 4000
+#define TEMP_READ_DELAY 500
+#define LCD_ROWS 2
+#define LCD_COLS 16
+#define Boot_MSGTIME 500          // time between boot-sequence messages, longer is more readable, reduce for speed.
+#define ScreenFlashDelay 100
+#define Revision "Version 1.1"
+
+const char *charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" ;
+
+
+// for pt100rtd
+#define RREF 430.0
+
+float setpoint = 0;
+
+// Contrain PWM output (set max to 1 for on/off control style)
+#define OUTPUT_MIN 0
+#define OUTPUT_MAX 255
+
+struct PIDConfig {
+    float kp;
+    float ki;
+    float kd;
+};
+struct Plate {
+    float temperature;    // Current temperature
+    float output;         // PID output specific to this plate
+    int heaterPin;        // GPIO pin for the heater    // Sensor resistance for the plate
+    PIDConfig pid;        // PID parameters
+
+    // Function to calculate the temperature
+    //  void updateTemperature(pt100rtd& pt100) {
+    //      uint16_t plate0.resistance = rtd0.getResistance();
+    //      uint32_t sensor_val = ((uint32_t)(plate0.resistance << 1)) * 100 * ((uint32_t)floor(RREF));
+    //      sensor_val >>= 16;
+    //      uint16_t ohmsx100 = (uint16_t)(sensor_val & 0xFFFF);
+    //      temperature = pt100.celsius(ohmsx100);
+    //}
+};
+
+Plate plate0 = {0.0, 0.0, PLATE_HEATER0, {0.12, 0.0005, 0.01}};
+Plate plate1 = {0.0, 0.0, PLATE_HEATER1, {0.12, 0.0005, 0.01}};
+MAX31865 rtd0;
+MAX31865 rtd1;
+LCD_I2C lcd(0x27, 16, 2);
+LCD_I2CAdapter lcdAdapter(&lcd);
+CharacterDisplayRenderer renderer(&lcdAdapter, LCD_COLS, LCD_ROWS);
+LcdMenu menu(renderer);
+SimpleRotary encoder(ENCODER_PIN_A, ENCODER_PIN_B, ENCODER_PIN_SW); // Meant to be 2,3,4 but my encoder is backwards to this
+SimpleRotaryAdapter rotaryInput(&menu, &encoder);
+STuneSettings sTuneConfig;
+sTune tunerPlate0 = sTune(&plate0.temperature, &plate0.output, tunerPlate0.ZN_PID, tunerPlate0.directIP, tunerPlate0.printOFF);
+sTune tunerPlate1 = sTune(&plate1.temperature, &plate1.output, tunerPlate1.ZN_PID, tunerPlate1.directIP, tunerPlate1.printOFF);
+QuickPID PIDPlate0(&plate0.temperature, &plate0.output, &setpoint);
+QuickPID PIDPlate1(&plate1.temperature, &plate1.output, &setpoint);
+pt100rtd PT100 = pt100rtd();
+
+// Function declarations
+void ScreenFlash();
+void bootSequence();
+void sampleUntilNonZero();
+void PrintRTDStatus(uint8_t status);
+void calculateTlut();
+void Temp_Sanity_Tests();
+void stop_failure();
+void callback(int pos);
+void toggleBacklight(bool isOn);
+//void PrintTemp();
+// setup function initializes the system
+void setup()
+{
+  // Initialize the LCD
+  lcd.begin();
+  
+  // Run the boot sequence to initialize all components
+  bootSequence();
+  
+  // Uncomment the following line if you want to initialize the renderer
+  // renderer.begin();                 
+}
+
+// tuner.Configure(inputSpan, outputSpan, outputStart, outputStep, testTimeSec, settleTimeSec, samples);
+// menu.setScreen(mainScreen);
+
+void loop()
+{
+  plate0.resistance = rtd0.getResistance();
+  Serial.print("Plate0 Resistance: ");
+  Serial.println(plate0.resistance);
+  rotaryInput.observe();
+  calculateTlut();
+  // lcd.clear();
+  // lcd.setCursor(0, 0);
+  // lcd.printf("Plate 0: ");
+  // lcd.print(plate0.temperature);
+  // lcd.setCursor(0, 1);
+  // lcd.printf("Plate 1: ");
+  // lcd.print(plate1.temperature);
+  // delay(TEMP_READ_DELAY);
+}
+
+// Safety functions
+void stop_failure()
+{
+  digitalWrite(PLATE_HEATER0, LOW);
+  digitalWrite(PLATE_HEATER1, LOW);
+  //Serial.print(f("Issue detected! Heaters off.");
+}
+void sampleUntilNonZero() {
+    do {
+        rtd0.sample();
+        rtd1.sample();
+        calculateTlut();
+    } while (plate1.temperature == 0 || plate0.temperature == 0);
+}
+void Temp_Sanity_Tests()
+{
+  if (plate0.temperature >= MAX_TEMP_CUTOFF_VALUE || plate1.temperature >= MAX_TEMP_CUTOFF_VALUE)
+  {
+    stop_failure();
+  }
+}
+
+void calculateTlut() {
+  rtd0.sample();
+  plate0.temperature = rtd0.getTemperature();
+  plate0.resistance = rtd0.getResistance();
+
+  rtd1.sample();
+  plate1.resistance = rtd1.getResistance();
+  plate1.temperature = rtd1.getTemperature();
+ 
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.printf("Plate 0: ");
+  lcd.print(plate0.temperature);
+  lcd.setCursor(0, 1);
+  lcd.printf("Plate 1: ");
+  lcd.print(plate1.temperature);
+  delay(TEMP_READ_DELAY);
+}
+void bootSequence()
+{
+  // Begin
+  Serial.begin(115200);
+  lcd.begin();
+  ScreenFlash();
+  lcd.backlight();
+  lcd.setCursor(3, 0);
+  lcd.print(F("Heat Plates"));
+  lcd.setCursor(3, 1);
+  lcd.print(F("by Badn1nja"));
+  delay(Boot_MSGTIME);
+  lcd.clear();
+  lcd.setCursor(3, 1);
+  lcd.print(Revision);
+  delay((Boot_MSGTIME * 2));
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F(" Start-Sequence")); // header used throughout sequence
+
+  // Initialize SPI
+  lcd.setCursor(5, 1);
+  lcd.print(F("SPI"));
+  SPI.begin();
+  delay(Boot_MSGTIME);
+
+  // Set pin modes
+  lcd.setCursor(5, 1);
+  lcd.print(F("Pins"));
+  pinMode(PLATE_HEATER0, OUTPUT);
+  pinMode(PLATE_HEATER1, OUTPUT);
+  pinMode(CS0_PIN, OUTPUT);
+  pinMode(CS1_PIN, OUTPUT);
+  delay(Boot_MSGTIME);
+
+  // Set up RTDs
+  lcd.setCursor(5, 1);
+  lcd.print(F("RTD"));
+  rtd0.begin(CS0_PIN, RTD_3_WIRE, RTD_TYPE_PT100);
+  rtd1.begin(CS1_PIN, RTD_3_WIRE, RTD_TYPE_PT100);
+  delay(Boot_MSGTIME);
+
+  // Set up PID
+  lcd.setCursor(5, 1);
+  lcd.print(F("PID"));
+  tunerPlate0.SetEmergencyStop(MAX_TEMP_CUTOFF_VALUE);
+  tunerPlate1.SetEmergencyStop(MAX_TEMP_CUTOFF_VALUE);
+
+  tunerPlate0.Configure(sTuneConfig.inputSpan, sTuneConfig.outputSpan, sTuneConfig.outputStart, 
+                     sTuneConfig.outputStep, sTuneConfig.testTimeSec, sTuneConfig.settleTimeSec, 
+                     sTuneConfig.samples);
+
+  tunerPlate1.Configure(sTuneConfig.inputSpan, sTuneConfig.outputSpan, sTuneConfig.outputStart, 
+                     sTuneConfig.outputStep, sTuneConfig.testTimeSec, sTuneConfig.settleTimeSec, 
+                     sTuneConfig.samples);
+
+  // PLATE0PID.setTimeStep(PID_UPDATE_INTERVAL);
+  // PLATE1PID.setTimeStep(PID_UPDATE_INTERVAL);
+  delay(Boot_MSGTIME);
+  // Display stabilizing message
+  lcd.setCursor(0, 1);
+  lcd.print(F(" Wait for Temp. "));
+  sampleUntilNonZero();
+  delay(Boot_MSGTIME);
+  lcd.clear();
+  Temp_Sanity_Tests();
+  lcd.setCursor(3, 0);
+  lcd.print(F("Setup Done"));
+  delay((Boot_MSGTIME * 2));
+  ScreenFlash();
+  lcd.clear();
+}
+void ScreenFlash()
+{
+  for (int i = 0; i < 2; i++)
+  {
+    lcd.noBacklight();
+    delay(ScreenFlashDelay);
+    lcd.backlight();
+    delay(ScreenFlashDelay);
+  }
+}
+
+// Define the callbacks
+void toggleBacklight(bool isOn)
+{
+  lcdAdapter.setBacklight(isOn);
+}
+
+//             PIDPlate0.Compute(); // Perform PID computation
+//             tunerPlate0.plotter(plate_temp0, optimumOutput, Setpoint, 0.5f, 3);
+//             break;
+//     }
+// }

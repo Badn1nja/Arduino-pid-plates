@@ -1,0 +1,432 @@
+/**************************************************
+ * Project: Heat Plate PID Controller System
+ * Author: Badn1nja
+ * Description:
+ *  This project controls the temperature of heat plates using PID controllers.
+ *  It reads temperature data from MAX31865 RTD sensors (Pt100), applies PID control 
+ *  to two heaters (PLATE_HEATER0 and PLATE_HEATER1), and displays key information 
+ *  on an LCD screen (16x2, I2C).
+ *
+ *  The user interacts with the system via an LCD menu interface, where they can:
+ *   - Start the system with default settings
+ *   - Adjust temperature settings
+ *   - Tune PID parameters (Kp, Ki, Kd)
+ *   - Perform an autotune to automatically adjust PID parameters
+ *   - Monitor real-time temperature readings and control feedback
+ *
+ *  The system uses AutoPID and sTune libraries for PID control and tuning, 
+ *  along with the SimpleRotary library to handle rotary encoder inputs.
+ * 
+ *  ** Hardware: **
+ *   - Arduino (e.g., Uno, Nano)
+ *   - MAX31865 RTD sensor (Pt100) for temperature measurement
+ *   - LCD I2C (16x2) display for UI
+ *   - Rotary Encoder for user interaction
+ *   - 2x PWM-controlled heating rods
+ *   
+ *  ** Libraries Used: **
+ *   - AutoPID (PID Control) 
+ *   - QuickPID (MAY BE USED Instead)
+ *   - sTune (PID Tuning)
+ *   - LcdMenu (Menu System)
+ *   - SimpleRotary (Rotary Encoder)
+ *   - MAX31865 (Temperature Sensing)
+ *   
+ **************************************************/
+
+/**************************************************
+ * Changelog:
+ * 
+ * v1.0/V1.05 (2025-01-25) - Initial Release
+ *  - Basic functionality: PID output control, temperature sensing, LCD display, Boot-Sequence, shutdown function.
+ *  - Menu system with Start, Temp Settings, and basic options.
+ *  - Configurable PID parameters (Kp, Ki, Kd) for each plate.
+ *  - Read temperature from MAX31865 sensors.
+ *  - Control heaters using PWM signals.
+ *  - pt100rtd implementation for improved accuracy
+ *  - Added safety checks for temperature limits (e.g., max cutoff).
+ *  - scrolling messages during setup.
+ *
+ * v1.1 (2025-01-xx) - Added Autotune Feature
+ *  - EEPROM support for settings and/or PID tunes (depending how quick automatic is, if this is fast enough it won't be required)
+ *  - change to quickpid 
+ *
+ * v1.2 (2025-0x-xx) - Menu and UI Enhancements
+ * *  - Added autotuning feature for automatic PID parameter adjustment. - Potential for autotuning for each 10c difference 60 - 120 if autotune is slow or has control problems
+ *  *  - Test PID functions
+ *  - Refined LCD menu navigation and added better user interaction.
+ *  - Improved handling of temperature settings through the menu.
+ *  - Added input validation for user-entered values.
+ *  - Fixed minor bugs in temperature readings and PID behavior.
+ *
+ * v1.3 (2025-0x-xx) - Stability and Performance Improvements
+ *  - Optimized PID control loops for better stability.
+ *  - Improved error handling and added additional safety mechanisms.
+ *  - Enhanced user interface
+ *  
+ *  ** TODO: **
+ *   - Implement logging functionality for PID performance data.
+ *   - Test with different heating elements and verify response time.
+ *   - Clean main.ccp with includes or config.h for less noise
+ **************************************************/
+
+
+#include "Arduino.h"
+// nclude <EEPROM.h>
+// Sensors
+#include <SPI.h>
+#include <PwFusion_MAX31865.h> 
+#include <pt100rtd.h>
+
+// display
+#include <Wire.h>
+#include <LCD_I2C.h> // old lib
+#define LCD_ROWS 2
+#define LCD_COLS 16
+
+// menu 
+#include <ItemCommand.h>
+#include <ItemInput.h>
+#include <ItemInputCharset.h>
+#include <ItemSubMenu.h>
+#include <LcdMenu.h>
+#include <display/LCD_I2CAdapter.h>
+#include <MenuScreen.h>
+#include <SimpleRotary.h>
+#include <input/SimpleRotaryAdapter.h>
+#include <renderer/CharacterDisplayRenderer.h>
+
+// pid
+// #include <AutoPID.h>
+#include <sTune.h>
+#include <QuickPID.h>
+// controll
+#include <SimpleRotary.h>
+#include <input/SimpleRotaryAdapter.h>
+
+const char* charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+//display menu
+// Heat Plates Specific
+#define Boot_MSGTIME 500 // time between boot-sequence messages, longer is more readable, reduce for speed.
+#define AMBIENT_TEMP_MSGTIME 1200 // time to show start temp
+#define ScreenFlashDelay 100
+#define Revision "Version 1.05"
+
+// S-Tune Settings
+uint32_t settleTimeSec = 10;
+uint32_t testTimeSec = 500;  // runPid interval = testTimeSec / samples
+const uint16_t samples = 500;
+const float inputSpan = 200;
+const float outputSpan = 1000;
+float outputStart = 0;
+float outputStep = 50;
+float tempLimit = 150;
+uint8_t debounce = 1;
+
+// Contrain PWM output (set max to 1 for on/off control style)
+#define OUTPUT_MIN 0                                                                                
+#define OUTPUT_MAX 255
+
+// PID Tuning - Set to LLM estimation
+float Kp_default = 0.125, Ki_default = 0.0003, Kd_default = 0;
+float KP0, KI0, KD0, KP1, KI1, KD1;
+
+// Global Variables
+double requested_temp = 0;
+double plate_temp0, plate_temp1, AMBIENT_TEMP, pid_out0, pid_out1;
+
+// for pt100rtd
+#define RREF 430.0
+// float ohms, Tlut ;  // don't think this is required
+
+const int CS0_PIN = 9;
+const int CS1_PIN = 8;
+
+#define MAX_TEMP_CUTOFF_VALUE 150 // safety cut off
+#define PID_UPDATE_INTERVAL 4000
+#define TEMP_READ_DELAY 500
+// Heater Pins
+#define PLATE_HEATER0 6
+#define PLATE_HEATER1 7
+#define ENCODER_PIN_A A1
+#define ENCODER_PIN_B A2
+#define ENCODER_PIN_SW A3
+
+MAX31865 rtd0;
+MAX31865 rtd1;
+
+LCD_I2C lcd(0x27, 16, 2);
+LCD_I2CAdapter lcdAdapter(&lcd);
+CharacterDisplayRenderer renderer(&lcdAdapter, LCD_COLS, LCD_ROWS);
+LcdMenu menu(renderer);
+SimpleRotary encoder(2, 3, 4);
+SimpleRotaryAdapter rotaryInput(&menu, &encoder);
+// QuickPID pid0(&plate_temp0, &requested_temp, &pid_out0);
+// QuickPID pid1(&plate_temp1, &requested_temp, &pid_out1);
+// AutoPID PLATE0PID(&plate_temp0, &requested_temp, &pid_out0, OUTPUT_MIN, OUTPUT_MAX, KP0, KI0, KD0);
+// AutoPID PLATE1PID(&plate_temp1, &requested_temp, &pid_out1, OUTPUT_MIN, OUTPUT_MAX, KP1, KI1, KD1);
+pt100rtd PT100 = pt100rtd();
+
+// Function declarations
+void ScreenFlash();
+void bootSequence();
+void sampleUntilNonZero();
+void Ambient();
+void welcome();
+void PrintRTDStatus(uint8_t status);
+void calculateTlut();
+void Temp_Sanity_Tests();
+void heaterPWM();
+void stop_failure();
+void callback(int pos);
+void toggleBacklight(bool isOn);
+void bootSequence();
+
+
+void setup() {
+lcd.begin();
+Serial.begin(115200);
+lcd.backlight();
+welcome();
+bootSequence();
+renderer.begin();
+//nu.setScreen(mainScreen);
+delay(1000); // test libary changes
+menu.hide();
+}
+
+void loop() {
+  rotaryInput.observe();
+  // Get the latest temperature and status values from the MAX31865
+  calculateTlut();
+  lcd.setCursor(0, 0);
+  lcd.printf("Plate 0: ");
+  plate_temp0 = rtd0.getTemperature();
+  lcd.print(plate_temp0);
+  lcd.setCursor(0, 1);
+  lcd.printf("Plate 1: ");
+  plate_temp1 = rtd1.getTemperature();
+  lcd.print(plate_temp1);
+  delay(100);
+  lcd.clear();
+  //PLATE0PID.run();
+  //PLATE1PID.run();
+  heaterPWM();
+}
+// Output Functions
+void heaterPWM()
+    {
+        analogWrite(PLATE_HEATER0, pid_out0);
+        analogWrite(PLATE_HEATER1, pid_out1);
+    }
+
+// Safety functions
+void stop_failure() {
+    digitalWrite(PLATE_HEATER0, LOW);
+    digitalWrite(PLATE_HEATER1, LOW);
+    Serial.println("Issue detected! Heaters off.");
+} 
+void sampleUntilNonZero() {
+    do {
+        rtd0.sample();
+        rtd1.sample();
+        plate_temp0 = rtd0.getTemperature();
+        plate_temp1 = rtd1.getTemperature();
+    } while (plate_temp0 == 0 || plate_temp1 == 0);
+}
+void Ambient() {
+    do {
+        plate_temp0 = rtd0.getTemperature();
+        plate_temp1 = rtd1.getTemperature();
+        AMBIENT_TEMP = (plate_temp0 + plate_temp1) / 2; //
+    } while (AMBIENT_TEMP == 0);
+}
+void Temp_Sanity_Tests() {
+    if (plate_temp1 >= MAX_TEMP_CUTOFF_VALUE || plate_temp0 >= MAX_TEMP_CUTOFF_VALUE) {
+        Serial.println("OVERTEMP Triggered");
+        stop_failure();
+    }
+    int deviance = fabs(plate_temp1 - plate_temp0);
+    Serial.printf("Deviance: %d\n", deviance);
+}
+// Fault Management functions
+void PrintRTDStatus(uint8_t status)
+{
+  // status will be 0 if no faults are active
+  if (status == 0)
+  {
+    Serial.print(F("OK"));
+  }
+  else 
+  {
+    // status is a bitmask, so multiple faults may be active at the same time
+
+    // The RTD temperature is above the threshold set by setHighFaultTemperature()
+    if (status & RTD_FAULT_TEMP_HIGH)
+    {
+      Serial.print(F("RTD High Threshold Met, "));
+    }
+
+    // The RTD temperature is below the threshold set by setHLowFaultTemperature()
+    if (status & RTD_FAULT_TEMP_LOW)
+    {
+      Serial.print(F("RTD Low Threshold Met, "));
+    }
+
+    // The RefIn- is > 0.85 x Vbias
+    if (status & RTD_FAULT_REFIN_HIGH)
+    {
+      Serial.print(F("REFin- > 0.85 x Vbias, "));
+    }
+
+    // The RefIn- or RtdIn- pin is < 0.85 x Vbia
+    if (status & (RTD_FAULT_REFIN_LOW_OPEN | RTD_FAULT_RTDIN_LOW_OPEN))
+    {
+      Serial.print(F("FORCE- open, "));
+    }
+
+    // The measured voltage at the RTD sense pins is too high or two low
+    if (status & RTD_FAULT_VOLTAGE_OOR)
+    {
+      Serial.print(F("Voltage out of range fault, "));
+    }
+  }
+
+  Serial.println();
+}
+void calculateTlut() {
+    uint16_t rtd_res0, rtd_res1;
+    uint32_t sensor;
+    rtd0.sample();
+    rtd1.sample();
+    // Calculate plate_temp0
+    rtd_res0 = rtd0.getResistance();
+    sensor = ((uint32_t)(rtd_res0 << 1)) * 100 * ((uint32_t) floor(RREF));
+    sensor >>= 16;
+    uint16_t ohmsx100 = (uint16_t)(sensor & 0xFFFF); // Use bitwise AND for cleaner shift
+    plate_temp0 = PT100.celsius(ohmsx100);
+
+    // Calculate plate_temp1
+    rtd_res1 = rtd1.getResistance();
+    sensor = ((uint32_t)(rtd_res1 << 1)) * 100 * ((uint32_t) floor(RREF));
+    sensor >>= 16;
+    uint16_t ohmsx100_2 = (uint16_t)(sensor & 0xFFFF); // Use bitwise AND for cleaner shift
+    plate_temp1 = PT100.celsius(ohmsx100_2);
+}
+void bootSequence() {
+    // Begin
+    lcd.print(" Start-Sequence"); // header used throughout sequence
+    // Initialize SPI
+    lcd.setCursor(5, 1);
+    lcd.print("SPI");
+    SPI.begin();
+    delay(Boot_MSGTIME);
+
+    // Set pin modes
+    pinMode(PLATE_HEATER0, OUTPUT);
+    pinMode(PLATE_HEATER1, OUTPUT);
+    pinMode(CS0_PIN, OUTPUT);
+    pinMode(CS1_PIN, OUTPUT);
+
+    //Set up RTDs
+    lcd.setCursor(5, 1);
+    lcd.begin();
+    lcd.backlight();
+    welcome();
+    lcd.setCursor(0, 0);
+    lcd.print(" Start-Sequence"); // header used throughout sequence
+    
+    //Initialize SPI
+    lcd.setCursor(5, 1);
+    lcd.print("SPI");lcd.print("RTD");
+    rtd0.begin(CS0_PIN, RTD_3_WIRE, RTD_TYPE_PT100);
+    rtd1.begin(CS1_PIN, RTD_3_WIRE, RTD_TYPE_PT100);
+    delay(Boot_MSGTIME);
+
+    // Set up PID
+    lcd.setCursor(5, 1);
+    lcd.print("PID");
+    //PLATE0PID.setTimeStep(PID_UPDATE_INTERVAL);
+    //PLATE1PID.setTimeStep(PID_UPDATE_INTERVAL);
+    delay(Boot_MSGTIME);
+
+    // Display stabilizing message
+    lcd.setCursor(0, 1);
+    lcd.print("Stabilising temp");
+    sampleUntilNonZero();
+    delay(Boot_MSGTIME);
+    // Log starting temperature
+    // Display stabilized message
+    lcd.setCursor(0, 1);
+    lcd.print("Stabilised temp ");
+    delay(Boot_MSGTIME);
+    lcd.clear();
+    Temp_Sanity_Tests();
+    lcd.setCursor(3, 0);
+    ScreenFlash();
+    lcd.print(F("Setup Done"));
+    delay((Boot_MSGTIME * 2));
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(" Starting Temp ");
+    lcd.setCursor(0, 1);
+    lcd.print("   ");
+    lcd.print(AMBIENT_TEMP);
+    lcd.print("c");
+    delay(AMBIENT_TEMP_MSGTIME);
+    lcd.clear();
+}
+void ScreenFlash() {
+    for (int i = 0; i < 2; i++) {
+        lcd.noBacklight();
+        delay(ScreenFlashDelay);
+        lcd.backlight();
+        delay(ScreenFlashDelay);
+    }
+}
+void welcome() {
+    ScreenFlash();
+    lcd.setCursor(3, 0);
+    lcd.print("Heat Plates");
+    lcd.setCursor(3, 1);
+    lcd.print("by Badn1nja");
+    for (int i = 0; i < 2; i++)
+    {
+        lcd.scrollDisplayLeft();
+        delay(500);
+        lcd.scrollDisplayRight();
+        delay(500);
+    }
+    lcd.clear();
+    lcd.setCursor(3, 1);
+    lcd.print(Revision);
+    delay((Boot_MSGTIME * 2));
+    lcd.clear();
+}
+
+void toggleBacklight(bool isOn) {
+    lcdAdapter.setBacklight(isOn);
+}
+
+void callback(int pos) {
+    Serial.println(pos);
+}
+
+// void clearInput() {
+
+//     if ((static_cast<ItemInput*>(userItems[0]))->setValue((char*)"")) {
+
+//         menu.refresh();
+//     }
+// }
+    // added eeprom functions    
+
+// //   autoTuningDone = true;  // For demonstration, auto-tuning is done after setup
+  
+// //   // If auto-tuning is done, save the tuned PID values to EEPROM
+// //   if (autoTuningDone) {
+// //     savePIDToEEPROM();
+// //   }
+// // }
+// Function to check and load PID values from EEPROM (for both sets)
