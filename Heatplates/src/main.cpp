@@ -188,8 +188,8 @@ sTune p1tuner = sTune(&PlateData1.temperature, &PlateData1.output, p1tuner.ZN_PI
 QuickPID PIDPlate0(&PlateData0.temperature, &PlateData0.output, &setpoint);
 QuickPID PIDPlate1(&PlateData1.temperature, &PlateData1.output, &setpoint);
 
-Plate plate0(MAX31865(), p0tuner, PIDPlate0, PlateData0, &STuneSettings());
-Plate plate1(MAX31865(), p1tuner, PIDPlate1, PlateData1, &STuneSettings());
+Plate plate0(MAX31865(), p0tuner, PIDPlate0, PlateData0, sTuneConfig);
+Plate plate1(MAX31865(), p1tuner, PIDPlate1, PlateData1, sTuneConfig);
 
 LCD_I2C lcd(0x27, 16, 2);
 LCD_I2CAdapter lcdAdapter(&lcd);
